@@ -89,22 +89,40 @@ class LandClient:
 
     def close(self) -> None:
         self.client.close()
-
     def bootstrap(self) -> None:
-        """정상 페이지 방문으로 서버가 발급하는 세션 쿠키를 저장."""
-        self.client.cookies.clear()
-        response = self.client.get(
-            MAP_URL,
-            headers={
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "image/avif,image/webp,*/*;q=0.8"
-                ),
-                "Content-Type": "text/html",
-            },
-        )
-        response.raise_for_status()
-        log.info("세션 쿠키 초기화: %s", sorted(self.client.cookies.keys()))
+    """네이버 초기 접속을 시도하되, 시간 초과 시 API 호출을 계속 진행."""
+    self.client.cookies.clear()
+
+    for attempt in range(3):
+        try:
+            response = self.client.get(
+                MAP_URL,
+                headers={
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,*/*;q=0.8"
+                    ),
+                    "Content-Type": "text/html",
+                },
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            log.info(
+                "세션 쿠키 초기화: %s",
+                sorted(self.client.cookies.keys()),
+            )
+            return
+
+        except httpx.HTTPError as exc:
+            log.warning(
+                "초기 접속 실패 %s/3: %s",
+                attempt + 1,
+                exc,
+            )
+            time.sleep(3 * (attempt + 1))
+
+    log.warning("초기 접속을 건너뛰고 API 요청을 계속합니다.")
+  
 
     def request_json(
         self,
