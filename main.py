@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable
 
 import gspread
@@ -255,15 +256,43 @@ class LandClient:
         return all_items
 
 
+def find_service_account_file() -> Path:
+    """현재 폴더에서 서비스계정 JSON 파일을 자동으로 찾습니다."""
+    base_dir = Path(__file__).resolve().parent
+    candidates = [
+        path for path in base_dir.glob("*.json")
+        if path.is_file()
+    ]
+
+    if not candidates:
+        raise FileNotFoundError(
+            "서비스계정 JSON 파일을 찾지 못했습니다. "
+            "main_pc.py와 같은 폴더에 다운로드한 .json 파일을 넣어주세요."
+        )
+
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("type") == "service_account" and data.get("client_email"):
+                return path
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    raise FileNotFoundError(
+        "폴더 안에 JSON 파일은 있지만 Google 서비스계정 키 파일을 찾지 못했습니다."
+    )
+
+
 def get_spreadsheet(settings: Settings) -> gspread.Spreadsheet:
-    raw = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    info = json.loads(raw)
+    service_account_path = find_service_account_file()
+    info = json.loads(service_account_path.read_text(encoding="utf-8"))
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     client = gspread.authorize(creds)
+    log.info("서비스계정 파일 사용: %s", service_account_path.name)
     return client.open_by_key(settings.sheet_id)
 
 
@@ -276,20 +305,28 @@ def ensure_worksheet(book: gspread.Spreadsheet, title: str, headers: list[str]) 
         ws.update("A1", [headers])
     return ws
 
-
 def load_complexes(book: gspread.Spreadsheet) -> list[dict[str, str]]:
     try:
         ws = book.worksheet("단지번호관리")
         records = ws.get_all_records()
+
         complexes = []
+
         for row in records:
-            if str(row.get("사용여부", "")).strip() != "사용":
-                continue
             name = str(row.get("단지명", "")).strip()
             number = str(row.get("단지번호", "")).strip()
+
             if name and number:
-                complexes.append({"name": name, "number": number})
-        return complexes or DEFAULT_COMPLEXES
+                complexes.append({
+                    "name": name,
+                    "number": number,
+                })
+
+        if complexes:
+            return complexes
+
+        return DEFAULT_COMPLEXES
+
     except gspread.WorksheetNotFound:
         return DEFAULT_COMPLEXES
 
@@ -446,7 +483,7 @@ def write_log(ws: gspread.Worksheet, job: str, result: str, count: int, message:
 
 def run() -> None:
     settings = Settings(
-        sheet_id=os.environ["GOOGLE_SHEET_ID"],
+        sheet_id=os.getenv("GOOGLE_SHEET_ID", "1Ax_z5OcACNd2Eb2Th19MD0LVgDR6O2dMU68hJmTPFJE"),
         request_delay=float(os.getenv("REQUEST_DELAY", "0.8")),
         max_pages=int(os.getenv("MAX_PAGES", "20")),
         page_size=int(os.getenv("PAGE_SIZE", "30")),
