@@ -121,7 +121,7 @@ class LandClient:
             )
             time.sleep(3 * (attempt + 1))
 
-    log.warning("초기 접속을 건너뛰고 API 요청을 계속합니다.")
+            log.warning("초기 접속을 건너뛰고 API 요청을 계속합니다.")
   
 
     def request_json(
