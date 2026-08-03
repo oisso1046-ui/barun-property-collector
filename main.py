@@ -89,10 +89,11 @@ class LandClient:
 
     def close(self) -> None:
         self.client.close()
+
     def bootstrap(self) -> None:
         """네이버 초기 접속을 시도하되, 시간 초과 시 API 호출을 계속 진행."""
         self.client.cookies.clear()
-    
+
         for attempt in range(3):
             try:
                 response = self.client.get(
@@ -113,16 +114,15 @@ class LandClient:
                 )
                 return
 
-        except httpx.HTTPError as exc:
-            log.warning(
-                "초기 접속 실패 %s/3: %s",
-                attempt + 1,
-                exc,
-            )
-            time.sleep(3 * (attempt + 1))
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "초기 접속 실패 %s/3: %s",
+                    attempt + 1,
+                    exc,
+                )
+                time.sleep(3 * (attempt + 1))
 
-            log.warning("초기 접속을 건너뛰고 API 요청을 계속합니다.")
-  
+        log.warning("초기 접속을 건너뛰고 API 요청을 계속합니다.")
 
     def request_json(
         self,
