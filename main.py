@@ -31,9 +31,13 @@ USER_AGENT = (
 )
 
 DEFAULT_COMPLEXES = [
-    {"name": "더샵데시앙 1단지", "number": "132577"},
-    {"name": "더샵데시앙 3차", "number": "141426"},
-    {"name": "더샵데시앙 4단지", "number": "125854"},
+    {"name": "사송우미린포레스트", "number": "147898"},
+    {"name": "사송더샵데시앙1단지", "number": "132577"},
+    {"name": "사송더샵데시앙3단지", "number": "191257"},
+    {"name": "사송더샵데시앙4단지", "number": "125854"},
+    {"name": "사송더샵데시앙5단지", "number": "103526"},
+    {"name": "사송더샵데시앙6단지", "number": "125853"},
+    {"name": "사송더샵데시앙7단지", "number": "125855"},
     {"name": "사송트루엘", "number": "129865"},
     {"name": "사송에비뉴원", "number": "151001"},
     {"name": "사송제일풍경채", "number": "144883"},
@@ -77,7 +81,7 @@ class LandClient:
         self.client = httpx.Client(
             http2=True,
             follow_redirects=True,
-            timeout=httpx.Timeout(25.0),
+            timeout=httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0),
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json, text/plain, */*",
@@ -131,7 +135,7 @@ class LandClient:
         url: str,
         *,
         payload: dict[str, Any] | None = None,
-        retries: int = 2,
+        retries: int = 4,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
 
@@ -257,44 +261,47 @@ class LandClient:
 
 
 def find_service_account_file() -> Path:
-    """현재 폴더에서 서비스계정 JSON 파일을 자동으로 찾습니다."""
+    """PC 실행 시 현재 폴더에서 Google 서비스계정 JSON 파일을 찾습니다."""
     base_dir = Path(__file__).resolve().parent
-    candidates = [
-        path for path in base_dir.glob("*.json")
-        if path.is_file()
-    ]
-
-    if not candidates:
-        raise FileNotFoundError(
-            "서비스계정 JSON 파일을 찾지 못했습니다. "
-            "main_pc.py와 같은 폴더에 다운로드한 .json 파일을 넣어주세요."
-        )
-
-    for path in candidates:
+    for path in base_dir.glob("*.json"):
+        if not path.is_file():
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if data.get("type") == "service_account" and data.get("client_email"):
                 return path
         except (OSError, json.JSONDecodeError):
             continue
-
     raise FileNotFoundError(
-        "폴더 안에 JSON 파일은 있지만 Google 서비스계정 키 파일을 찾지 못했습니다."
+        "서비스계정 JSON 파일을 찾지 못했습니다. "
+        "PC에서는 main.py와 같은 폴더에 서비스계정 .json 파일을 넣어주세요."
     )
 
 
 def get_spreadsheet(settings: Settings) -> gspread.Spreadsheet:
-    service_account_path = find_service_account_file()
-    info = json.loads(service_account_path.read_text(encoding="utf-8"))
+    """GitHub에서는 Secret을, PC에서는 같은 폴더의 JSON 파일을 사용합니다."""
+    secret_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    if secret_json:
+        try:
+            info = json.loads(secret_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "GitHub Secret GOOGLE_SERVICE_ACCOUNT_JSON 형식이 올바르지 않습니다."
+            ) from exc
+        log.info("GitHub Secret 서비스계정 사용")
+    else:
+        service_account_path = find_service_account_file()
+        info = json.loads(service_account_path.read_text(encoding="utf-8"))
+        log.info("PC 서비스계정 파일 사용: %s", service_account_path.name)
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     client = gspread.authorize(creds)
-    log.info("서비스계정 파일 사용: %s", service_account_path.name)
     return client.open_by_key(settings.sheet_id)
-
 
 def ensure_worksheet(book: gspread.Spreadsheet, title: str, headers: list[str]) -> gspread.Worksheet:
     try:
@@ -305,28 +312,20 @@ def ensure_worksheet(book: gspread.Spreadsheet, title: str, headers: list[str]) 
         ws.update("A1", [headers])
     return ws
 
+
 def load_complexes(book: gspread.Spreadsheet) -> list[dict[str, str]]:
     try:
         ws = book.worksheet("단지번호관리")
         records = ws.get_all_records()
-
         complexes = []
-
         for row in records:
+            if str(row.get("사용여부", "")).strip() != "사용":
+                continue
             name = str(row.get("단지명", "")).strip()
             number = str(row.get("단지번호", "")).strip()
-
             if name and number:
-                complexes.append({
-                    "name": name,
-                    "number": number,
-                })
-
-        if complexes:
-            return complexes
-
-        return DEFAULT_COMPLEXES
-
+                complexes.append({"name": name, "number": number})
+        return complexes or DEFAULT_COMPLEXES
     except gspread.WorksheetNotFound:
         return DEFAULT_COMPLEXES
 
@@ -362,46 +361,105 @@ def upsert_rows(
     return len(new_rows), updated
 
 
-def normalize_apartment(item: dict[str, Any], complex_name: str, complex_number: str) -> list[Any]:
+def deep_first(value: Any, keys: Iterable[str]) -> Any:
+    """중첩된 네이버 응답에서도 첫 번째 유효 값을 찾습니다."""
+    def visit(node: Any) -> Any:
+        if isinstance(node, dict):
+            for key in keys:
+                if key in node and node[key] not in (None, "", [], {}):
+                    return node[key]
+            for child in node.values():
+                found = visit(child)
+                if found not in (None, "", [], {}):
+                    return found
+        elif isinstance(node, list):
+            for child in node:
+                found = visit(child)
+                if found not in (None, "", [], {}):
+                    return found
+        return ""
+    return visit(value)
+
+
+def format_price(value: Any) -> str:
+    """가격 객체나 숫자를 사람이 읽는 금액으로 바꿉니다."""
+    if isinstance(value, dict):
+        nested = deep_first(
+            value,
+            ["dealPrice", "warrantPrice", "rentPrice", "price", "amount", "value", "priceText"],
+        )
+        return format_price(nested) if nested not in ("", value) else json.dumps(value, ensure_ascii=False)
+
+    if isinstance(value, (int, float)):
+        amount = int(value)
+        if amount >= 100_000_000:
+            eok, remainder = divmod(amount, 100_000_000)
+            man = remainder // 10_000
+            return f"{eok}억" + (f" {man:,}만" if man else "")
+        if amount >= 10_000:
+            return f"{amount // 10_000:,}만"
+        return f"{amount:,}"
+
+    text_value = str(value or "").strip()
+    if not text_value:
+        return ""
+    return format_price(int(text_value)) if text_value.isdigit() else text_value
+
+
+def clean_value(item: dict[str, Any], keys: Iterable[str]) -> str:
+    return text(deep_first(item, keys))
+
+
+def normalize_apartment(
+    item: dict[str, Any],
+    complex_name: str,
+    complex_number: str,
+) -> list[Any]:
+    price_value = deep_first(
+        item,
+        ["priceText", "dealPrice", "price", "priceInfo", "warrantPrice", "rentPrice"],
+    )
     return [
         now_text(),
-        text(first(item, ["articleNumber", "articleNo", "articleId", "id"])),
+        clean_value(item, ["articleNumber", "articleNo", "articleId", "id"]),
         complex_name,
         complex_number,
-        text(first(item, ["tradeTypeName", "tradeType", "dealTypeName"])),
-        text(first(item, ["price", "dealPrice", "priceText", "priceInfo"])),
-        text(first(item, ["dongName", "buildingName", "dong", "articleBuildingName"])),
-        text(first(item, ["floorInfo", "floor", "articleFloor"])),
-        text(first(item, ["supplySpace", "supplyArea", "area1", "pyeongName"])),
-        text(first(item, ["exclusiveSpace", "exclusiveArea", "area2"])),
-        text(first(item, ["direction", "directionName"])),
-        text(first(item, ["articleName", "articleTitle", "description", "featureDescription"])),
-        text(first(item, ["realtorName", "brokerageName", "cpName"])),
-        text(first(item, ["verificationDate", "confirmDate", "articleConfirmYmd"])),
+        clean_value(item, ["tradeTypeName", "tradeType", "dealTypeName"]),
+        format_price(price_value),
+        clean_value(item, ["dongName", "buildingName", "dong", "articleBuildingName"]),
+        clean_value(item, ["floorInfo", "floor", "articleFloor"]),
+        clean_value(item, ["supplySpace", "supplyArea", "area1", "pyeongName"]),
+        clean_value(item, ["exclusiveSpace", "exclusiveArea", "area2"]),
+        clean_value(item, ["direction", "directionName"]),
+        clean_value(item, ["articleName", "articleTitle", "description", "featureDescription"]),
+        clean_value(item, ["realtorName", "brokerageName", "cpName"]),
+        clean_value(item, ["verificationDate", "confirmDate", "articleConfirmYmd"]),
         "현재",
-        text(first(item, ["realEstateTypeName", "realEstateTypeCode", "realEstateType"])),
+        clean_value(item, ["realEstateTypeName", "realEstateTypeCode", "realEstateType"]),
         truncate(json.dumps(item, ensure_ascii=False), 45000),
     ]
-
 
 def normalize_region(item: dict[str, Any]) -> list[Any]:
+    price_value = deep_first(
+        item,
+        ["priceText", "dealPrice", "price", "priceInfo", "warrantPrice", "rentPrice"],
+    )
     return [
         now_text(),
-        text(first(item, ["articleNumber", "articleNo", "articleId", "id"])),
-        text(first(item, ["realEstateTypeName", "realEstateType", "realEstateTypeCode"])),
-        text(first(item, ["tradeTypeName", "tradeType", "dealTypeName"])),
-        text(first(item, ["price", "dealPrice", "priceText", "priceInfo"])),
-        text(first(item, ["address", "roadAddress", "location", "articleAddress", "detailAddress"])),
-        text(first(item, ["floorInfo", "floor", "articleFloor"])),
-        text(first(item, ["exclusiveSpace", "supplySpace", "area", "landArea", "space"])),
-        text(first(item, ["articleName", "articleTitle", "description", "featureDescription"])),
-        text(first(item, ["realtorName", "brokerageName", "cpName"])),
-        text(first(item, ["verificationDate", "confirmDate", "articleConfirmYmd"])),
+        clean_value(item, ["articleNumber", "articleNo", "articleId", "id"]),
+        clean_value(item, ["realEstateTypeName", "realEstateType", "realEstateTypeCode"]),
+        clean_value(item, ["tradeTypeName", "tradeType", "dealTypeName"]),
+        format_price(price_value),
+        clean_value(item, ["address", "roadAddress", "location", "articleAddress", "detailAddress"]),
+        clean_value(item, ["floorInfo", "floor", "articleFloor"]),
+        clean_value(item, ["exclusiveSpace", "supplySpace", "area", "landArea", "space"]),
+        clean_value(item, ["articleName", "articleTitle", "description", "featureDescription"]),
+        clean_value(item, ["realtorName", "brokerageName", "cpName"]),
+        clean_value(item, ["verificationDate", "confirmDate", "articleConfirmYmd"]),
         "현재",
-        text(first(item, ["realEstateTypeCode", "realEstateTypeName", "realEstateType"])),
+        clean_value(item, ["realEstateTypeCode", "realEstateTypeName", "realEstateType"]),
         truncate(json.dumps(item, ensure_ascii=False), 45000),
     ]
-
 
 def is_land(row: list[Any]) -> bool:
     label = str(row[2])
