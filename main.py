@@ -79,9 +79,9 @@ class LandClient:
     def __init__(self, delay: float = 0.8) -> None:
         self.delay = delay
         self.client = httpx.Client(
-            http2=True,
+            http2=False,
             follow_redirects=True,
-            timeout=httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0),
+            timeout=httpx.Timeout(connect=20.0, read=45.0, write=20.0, pool=20.0),
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json, text/plain, */*",
@@ -96,38 +96,20 @@ class LandClient:
         self.client.close()
 
     def bootstrap(self) -> None:
-        """네이버 초기 접속을 시도하되, 시간 초과 시 API 호출을 계속 진행."""
+        """GitHub에서는 느린 지도 초기 접속을 건너뜁니다."""
         self.client.cookies.clear()
 
-        for attempt in range(3):
-            try:
-                response = self.client.get(
-                    MAP_URL,
-                    headers={
-                        "Accept": (
-                            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                            "image/avif,image/webp,*/*;q=0.8"
-                        ),
-                        "Content-Type": "text/html",
-                    },
-                    timeout=60.0,
-                )
-                response.raise_for_status()
-                log.info(
-                    "세션 쿠키 초기화: %s",
-                    sorted(self.client.cookies.keys()),
-                )
-                return
+        if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+            log.info("GitHub Actions 환경: 초기 지도 접속 생략")
+            return
 
-            except httpx.HTTPError as exc:
-                log.warning(
-                    "초기 접속 실패 %s/3: %s",
-                    attempt + 1,
-                    exc,
-                )
-                time.sleep(3 * (attempt + 1))
+        try:
+            response = self.client.get(MAP_URL, timeout=15.0)
+            response.raise_for_status()
+            log.info("세션 초기화 완료")
+        except httpx.HTTPError as exc:
+            log.warning("초기 접속 실패, API를 바로 호출합니다: %s", exc)
 
-        log.warning("초기 접속을 건너뛰고 API 요청을 계속합니다.")
 
     def request_json(
         self,
@@ -135,25 +117,23 @@ class LandClient:
         url: str,
         *,
         payload: dict[str, Any] | None = None,
-        retries: int = 4,
+        retries: int = 5,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
 
         for attempt in range(retries + 1):
             time.sleep(self.delay)
             try:
-                response = self.client.request(method, url, json=payload)
-
-                if response.status_code in {401, 403}:
-                    if attempt >= retries:
-                        raise RuntimeError(f"접근 거부 HTTP {response.status_code}")
-                    log.warning("세션 재초기화 후 재시도: HTTP %s", response.status_code)
-                    self.bootstrap()
-                    continue
+                response = self.client.request(
+                    method,
+                    url,
+                    json=payload,
+                    headers={"Connection": "close"},
+                )
 
                 if response.status_code == 429:
-                    wait = min(30, 5 * (attempt + 1))
-                    log.warning("요청 제한 HTTP 429, %s초 대기", wait)
+                    wait = min(60, 10 * (attempt + 1))
+                    log.warning("HTTP 429, %s초 대기", wait)
                     time.sleep(wait)
                     continue
 
@@ -164,9 +144,18 @@ class LandClient:
                 last_error = exc
                 if attempt >= retries:
                     break
-                time.sleep(2 ** attempt)
+
+                wait = min(30, 3 * (attempt + 1))
+                log.warning(
+                    "API 요청 재시도 %s/%s: %s",
+                    attempt + 1,
+                    retries,
+                    exc,
+                )
+                time.sleep(wait)
 
         raise RuntimeError(f"API 요청 실패: {last_error}")
+
 
     def fetch_complex(self, complex_number: str, page_size: int, max_pages: int) -> list[dict[str, Any]]:
         all_items: list[dict[str, Any]] = []
@@ -336,79 +325,47 @@ def upsert_rows(
     rows: list[list[Any]],
     id_index: int = 1,
 ) -> tuple[int, int]:
+    """기존 행 수정은 한 번의 batch_update로 처리해 Google Sheets 쿼터를 절약합니다."""
     existing_values = ws.get_all_values()
     existing_map: dict[str, int] = {}
+
     for idx, row in enumerate(existing_values[1:], start=2):
         if len(row) > id_index and row[id_index]:
-            existing_map[row[id_index]] = idx
+            existing_map[str(row[id_index])] = idx
 
     new_rows: list[list[Any]] = []
-    updated = 0
+    update_requests: list[dict[str, Any]] = []
+
     for row in rows:
-        article_id = str(row[id_index])
+        article_id = str(row[id_index]).strip()
         if not article_id:
             continue
+
         if article_id in existing_map:
-            target = existing_map[article_id]
-            ws.update(f"A{target}", [row])
-            updated += 1
+            target_row = existing_map[article_id]
+            update_requests.append({
+                "range": f"A{target_row}:{column_letter(len(headers))}{target_row}",
+                "values": [row],
+            })
         else:
             new_rows.append(row)
+
+    if update_requests:
+        ws.batch_update(update_requests, value_input_option="RAW")
 
     if new_rows:
         ws.append_rows(new_rows, value_input_option="RAW")
 
-    return len(new_rows), updated
+    return len(new_rows), len(update_requests)
 
 
-def deep_first(value: Any, keys: Iterable[str]) -> Any:
-    """중첩된 네이버 응답에서도 첫 번째 유효 값을 찾습니다."""
-    def visit(node: Any) -> Any:
-        if isinstance(node, dict):
-            for key in keys:
-                if key in node and node[key] not in (None, "", [], {}):
-                    return node[key]
-            for child in node.values():
-                found = visit(child)
-                if found not in (None, "", [], {}):
-                    return found
-        elif isinstance(node, list):
-            for child in node:
-                found = visit(child)
-                if found not in (None, "", [], {}):
-                    return found
-        return ""
-    return visit(value)
-
-
-def format_price(value: Any) -> str:
-    """가격 객체나 숫자를 사람이 읽는 금액으로 바꿉니다."""
-    if isinstance(value, dict):
-        nested = deep_first(
-            value,
-            ["dealPrice", "warrantPrice", "rentPrice", "price", "amount", "value", "priceText"],
-        )
-        return format_price(nested) if nested not in ("", value) else json.dumps(value, ensure_ascii=False)
-
-    if isinstance(value, (int, float)):
-        amount = int(value)
-        if amount >= 100_000_000:
-            eok, remainder = divmod(amount, 100_000_000)
-            man = remainder // 10_000
-            return f"{eok}억" + (f" {man:,}만" if man else "")
-        if amount >= 10_000:
-            return f"{amount // 10_000:,}만"
-        return f"{amount:,}"
-
-    text_value = str(value or "").strip()
-    if not text_value:
-        return ""
-    return format_price(int(text_value)) if text_value.isdigit() else text_value
-
-
-def clean_value(item: dict[str, Any], keys: Iterable[str]) -> str:
-    return text(deep_first(item, keys))
-
+def column_letter(number: int) -> str:
+    """1부터 시작하는 열 번호를 A, B, ... 형식으로 변환합니다."""
+    result = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
 
 def normalize_apartment(
     item: dict[str, Any],
