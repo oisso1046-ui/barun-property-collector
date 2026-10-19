@@ -130,12 +130,8 @@ class LandClient:
         """GitHub에서는 느린 지도 초기 접속을 건너뜁니다."""
         self.client.cookies.clear()
 
-        if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
-            log.info("GitHub Actions 환경: 초기 지도 접속 생략")
-            return
-
         try:
-            response = self.client.get(MAP_URL, timeout=15.0)
+            response = self.client.get(MAP_URL, timeout=30.0)
             response.raise_for_status()
             log.info("세션 초기화 완료")
         except httpx.HTTPError as exc:
