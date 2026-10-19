@@ -43,13 +43,44 @@ DEFAULT_COMPLEXES = [
     {"name": "사송제일풍경채", "number": "144883"},
 ]
 
-BOUNDING_BOX = {
-    "left": 129.05031982887942,
-    "right": 129.12130097112458,
-    "top": 35.32954512979022,
-    "bottom": 35.28137470013591,
-}
-
+REGION_BOXES = [
+        {
+                    "name": "금정구(사송)",
+                    "box": {
+                                    "left": 129.05031982887942,
+                                    "right": 129.12130097112458,
+                                    "top": 35.32954512979022,
+                                    "bottom": 35.28137470013591,
+                    },
+        },
+        {
+                    "name": "부산강서구",
+                    "box": {
+                                    "left": 128.82,
+                                    "right": 129.02,
+                                    "top": 35.25,
+                                    "bottom": 35.05,
+                    },
+        },
+        {
+                    "name": "김해진영",
+                    "box": {
+                                    "left": 128.70,
+                                    "right": 128.80,
+                                    "top": 35.35,
+                                    "bottom": 35.28,
+                    },
+        },
+        {
+                    "name": "창원",
+                    "box": {
+                                    "left": 128.55,
+                                    "right": 128.75,
+                                    "top": 35.30,
+                                    "bottom": 35.15,
+                    },
+        },
+]
 TRADE_TYPES = ["A1", "B2", "B1", "B3"]
 REGION_TYPES = ["D02", "D01", "D03", "D04", "E01", "Z00", "E03", "E02", "E04"]
 
@@ -194,7 +225,7 @@ class LandClient:
 
         return all_items
 
-    def fetch_region(self, page_size: int, max_pages: int) -> list[dict[str, Any]]:
+    def fetch_region(self, page_size: int, max_pages: int, bounding_box: dict[str, float]) -> list[dict[str, Any]]:
         all_items: list[dict[str, Any]] = []
         seen: set[str] = set()
         last_info: list[Any] = []
@@ -218,7 +249,7 @@ class LandClient:
                     "entranceTypes": [],
                     "hasArticle": False,
                 },
-                "boundingBox": BOUNDING_BOX,
+                "boundingBox": bounding_box,
                 "precision": 13.463091604384706,
                 "userChannelType": "PC",
                 "articlePagingRequest": {
@@ -535,7 +566,7 @@ def run() -> None:
                 f"신규 {new_count} / 갱신 {updated_count}",
             )
 
-        region_items = client.fetch_region(settings.page_size, settings.max_pages)
+        region_items = [item for region in REGION_BOXES for item in client.fetch_region(settings.page_size, settings.max_pages, region["box"])]
         region_rows = [normalize_region(item) for item in region_items]
         land_rows = [row for row in region_rows if is_land(row)]
         commercial_rows = [row for row in region_rows if not is_land(row)]
